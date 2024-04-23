@@ -3,16 +3,13 @@ import os
 import time
 import warnings
 
-import matplotlib.pyplot as plt 
-import cv2
-import sys
-import numpy as np
 import presets
 import torch
 import torch.utils.data
 import torchvision
 import utils
 from coco_utils import get_coco
+from dataset.sun import SunRGBDSegmentation
 from torch import nn
 from torch.optim.lr_scheduler import PolynomialLR
 from torchvision.transforms import functional as F, InterpolationMode
@@ -42,11 +39,13 @@ def get_dataset(args, is_train):
         "voc": (args.data_path, voc, 21),
         "voc_aug": (args.data_path, sbd, 21),
         "coco": (args.data_path, get_coco, 21),
+        "sun": (args.data_path, SunRGBDSegmentation, 38), #내가 추가한 데이터셋 (SUNRGBD)
     }
     p, ds_fn, num_classes = paths[args.dataset]
 
     image_set = "train" if is_train else "val"
-    ds = ds_fn(p, image_set=image_set, transforms=get_transform(is_train, args), use_v2=args.use_v2)
+    # ds = ds_fn(p, image_set=image_set, transforms=get_transform(is_train, args), use_v2=args.use_v2)
+    ds=ds_fn(p, image_set=image_set, transforms=get_transform(is_train, args))
     return ds, num_classes
 
 
@@ -66,7 +65,6 @@ def get_transform(is_train, args):
         return preprocessing
     else:
         return presets.SegmentationPresetEval(base_size=520, backend=args.backend, use_v2=args.use_v2)
-
 
 
 def criterion(inputs, target):
@@ -115,8 +113,7 @@ def evaluate(model, data_loader, device, num_classes):
 
     return confmat
 
-train_losses=[]
-losses=[]
+
 def train_one_epoch(model, criterion, optimizer, data_loader, lr_scheduler, device, epoch, print_freq, scaler=None):
     model.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -139,12 +136,7 @@ def train_one_epoch(model, criterion, optimizer, data_loader, lr_scheduler, devi
 
         lr_scheduler.step()
 
-        loss_value=loss.item()
-
         metric_logger.update(loss=loss.item(), lr=optimizer.param_groups[0]["lr"])
-        train_losses.append(loss_value)
-    losses.append(min(train_losses))
-    train_losses.clear()
 
 
 def main(args):
@@ -156,11 +148,9 @@ def main(args):
 
     if args.output_dir:
         utils.mkdir(args.output_dir)
-    
+
     #utils.init_distributed_mode(args)
     #print(args)
-    
-    #distribute
     args.distributed=False
 
     device = torch.device(args.device)
@@ -174,6 +164,7 @@ def main(args):
     dataset, num_classes = get_dataset(args, is_train=True)
     dataset_test, _ = get_dataset(args, is_train=False)
 
+    print(len(dataset))
     if args.distributed:
         train_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
         test_sampler = torch.utils.data.distributed.DistributedSampler(dataset_test, shuffle=False)
@@ -270,18 +261,8 @@ def main(args):
         if args.distributed:
             train_sampler.set_epoch(epoch)
         train_one_epoch(model, criterion, optimizer, data_loader, lr_scheduler, device, epoch, args.print_freq, scaler)
-        # loss graph
-        train_losses_np = torch.tensor(losses).cpu().numpy()
-        plt.plot(range(1, len(train_losses_np) + 1), train_losses_np, label='Train Loss',color='red',
-                    marker='o',markersize=3.0)
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss')
-        plt.legend(('L'),loc='center right')
-        plt.pause(0.1)
-        #evaluate
-        confmat = evaluate(model, data_loader_test, device=device, num_classes=num_classes)
-        print(confmat)
-        #model save as dict
+        #confmat = evaluate(model, data_loader_test, device=device, num_classes=num_classes)
+        #print(confmat)
         checkpoint = {
             "model": model_without_ddp.state_dict(),
             "optimizer": optimizer.state_dict(),
@@ -304,8 +285,8 @@ def get_args_parser(add_help=True):
 
     parser = argparse.ArgumentParser(description="PyTorch Segmentation Training", add_help=add_help)
 
-    parser.add_argument("--data-path", default="./", type=str, help="dataset path")
-    parser.add_argument("--dataset", default="voc", type=str, help="dataset name")
+    parser.add_argument("--data-path", default="/datasets01/COCO/022719/", type=str, help="dataset path")
+    parser.add_argument("--dataset", default="coco", type=str, help="dataset name")
     parser.add_argument("--model", default="fcn_resnet101", type=str, help="model name")
     parser.add_argument("--aux-loss", action="store_true", help="auxiliary loss")
     parser.add_argument("--device", default="cuda", type=str, help="device (Use cuda or cpu Default: cuda)")
@@ -332,7 +313,7 @@ def get_args_parser(add_help=True):
     parser.add_argument("--lr-warmup-method", default="linear", type=str, help="the warmup method (default: linear)")
     parser.add_argument("--lr-warmup-decay", default=0.01, type=float, help="the decay for lr")
     parser.add_argument("--print-freq", default=10, type=int, help="print frequency")
-    parser.add_argument("--output-dir", default="./model", type=str, help="path to save outputs")
+    parser.add_argument("--output-dir", default=".", type=str, help="path to save outputs")
     parser.add_argument("--resume", default="", type=str, help="path of checkpoint")
     parser.add_argument("--start-epoch", default=0, type=int, metavar="N", help="start epoch")
     parser.add_argument(
@@ -358,31 +339,36 @@ def get_args_parser(add_help=True):
     parser.add_argument("--use-v2", action="store_true", help="Use V2 transforms")
     return parser
 
-def test(args):
-    #test dataset
-    dataset_test, num_classes = get_dataset(args, is_train=False)
-
-    # model load
+def onnx_exporting(args):
+    device = torch.device(args.device) #set device
+    #test model
     model = torchvision.models.get_model(
         args.model,
         weights=args.weights,
         weights_backbone=args.weights_backbone,
-        num_classes=num_classes,
+        num_classes=38,
         aux_loss=args.aux_loss,
     )
-    load_model(model,'./model/checkpoint')
-
-    #추론
-    with torch.no_grad():
-        outputs = model(dataset_test[0])
-        _, predicted = torch.max(outputs, 1)
+    load_model(model,"./models/model_99.pth")
+    model.eval()
+ 
+    # generate model input to build the graph
+    generated_input = torch.autograd.Variable(
+    torch.randn((1, 3, 224, 224),device=args.device)
+    )
     
-    plt.show(np.array())
-
-
-
+    # model export into ONNX format
+    torch.onnx.export(
+        model,
+        generated_input,
+        "fcn_resnet50.onnx",
+        verbose=True,
+        input_names=["input_0"],
+        output_names=["output_0"],
+        opset_version=11
+    )
 
 if __name__ == "__main__":
     args = get_args_parser().parse_args()
-    main(args) #train
-    #test(args) #test
+    main(args)
+    #onnx_exporting(args)
